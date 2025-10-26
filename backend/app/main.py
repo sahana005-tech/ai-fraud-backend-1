@@ -57,6 +57,80 @@ def login(request: LoginRequest, db: Session = Depends(auth.get_db)):
     return {"access_token": token, "token_type": "bearer"}
 
 @app.get("/")
+import random
+from datetime import datetime
+
+# ----------------------------
+# DUMMY BANK ACCOUNT LINKING
+# ----------------------------
+@app.post("/bank/link")
+def link_dummy_account(db: Session = Depends(auth.get_db)):
+    """Simulate linking a dummy bank account."""
+    dummy_account = models.Account(
+        account_name="Axis Bank Primary Account",
+        account_number="AXISXXXX8765",
+        bank_name="Axis Bank"
+    )
+    db.add(dummy_account)
+    db.commit()
+    db.refresh(dummy_account)
+    return {"message": "Dummy bank account linked successfully", "account_id": dummy_account.id}
+
+
+# ----------------------------
+# GENERATE DUMMY TRANSACTIONS
+# ----------------------------
+@app.post("/transactions/generate")
+def generate_dummy_transactions(db: Session = Depends(auth.get_db)):
+    """Generate 10 random dummy transactions with risk scoring."""
+    merchants = ["Amazon", "Flipkart", "Swiggy", "Uber", "Zomato", "Myntra", "BigBasket", "IRCTC", "Paytm", "Ola"]
+    new_txns = []
+
+    # Get the first account
+    account = db.query(models.Account).first()
+    if not account:
+        raise HTTPException(status_code=400, detail="No linked account found. Link one using /bank/link first.")
+
+    for i in range(10):
+        amount = round(random.uniform(100, 15000), 2)
+        risk_score = round(random.uniform(10, 100), 2)
+        risk_label = (
+            "High Risk 🚨" if risk_score > 90 else
+            "Suspicious ⚠️" if risk_score > 70 else
+            "Safe ✅"
+        )
+        blocked = risk_score > 90
+        verification_required = 70 < risk_score <= 90
+
+        txn = models.Transaction(
+            account_id=account.id,
+            txn_id=f"TXN{i+1}{random.randint(1000,9999)}",
+            amount=amount,
+            merchant=random.choice(merchants),
+            timestamp=datetime.utcnow(),
+            risk_score=risk_score,
+            risk_label=risk_label,
+            blocked=blocked,
+            verification_required=verification_required,
+            verification_status="pending" if verification_required else "none",
+            reasons="['Unusual amount', 'Merchant mismatch']" if risk_score > 80 else "[]"
+        )
+
+        db.add(txn)
+        db.commit()
+        db.refresh(txn)
+        new_txns.append({
+            "txn_id": txn.txn_id,
+            "amount": txn.amount,
+            "merchant": txn.merchant,
+            "risk_score": txn.risk_score,
+            "risk_label": txn.risk_label,
+            "blocked": txn.blocked,
+            "verification_required": txn.verification_required
+        })
+
+    return {"message": "Dummy transactions generated successfully", "transactions": new_txns}
+
 def root():
     """Root endpoint to verify the backend is live."""
     return {"message": "AI Fraud Detection Backend Running 🚀 with Auth enabled!"}
