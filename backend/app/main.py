@@ -1,243 +1,121 @@
-# backend/app/main.py
-from fastapi import FastAPI, Depends, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
-from datetime import timedelta, datetime
-from pydantic import BaseModel, EmailStr
-from typing import List, Optional
+from pydantic import BaseModel
+from typing import List
+from jose import jwt
+from datetime import datetime, timedelta
 import random
-import logging
 
-from .db import Base, engine, SessionLocal
-from . import models, auth
+# --- SIMPLE IN-MEMORY DATABASE (TEMPORARY) ---
+USERS = {}
+TRANSACTIONS = []
+DUMMY_ACCOUNT = None
 
-# ----------------------------
-# Logging
-# ----------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ai-fraud-backend")
+# --- CONFIG ---
+SECRET_KEY = "secret-key-demo"
+ALGORITHM = "HS256"
 
-# ----------------------------
-# Create DB tables
-# ----------------------------
-Base.metadata.create_all(bind=engine)
+app = FastAPI(title="AI Fraud Detection Backend")
 
-# ----------------------------
-# App init + CORS
-# ----------------------------
-app = FastAPI(title="AI Fraud Detection Backend - Stable")
-
+# --- CORS for Lovable / Base44 / Frontend ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For development allow all; later restrict to your frontend URL
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ----------------------------
-# DB dependency
-# ----------------------------
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-# ----------------------------
-# Request models
-# ----------------------------
+# --- MODELS ---
 class SignupRequest(BaseModel):
-    email: EmailStr
+    email: str
     password: str
 
 class LoginRequest(BaseModel):
-    email: EmailStr
+    email: str
     password: str
 
-# Response small models
-class SimpleMessage(BaseModel):
-    message: str
+class Transaction(BaseModel):
+    txn_id: str
+    amount: float
+    merchant: str
+    risk_score: float
+    risk_label: str
+    blocked: bool
 
-# ----------------------------
-# Utility: safe commit wrapper
-# ----------------------------
-def safe_commit(db: Session):
-    try:
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        logger.error("DB commit failed: %s", e)
-        raise
+# --- AUTH HELPERS ---
+def create_token(email: str):
+    expire = datetime.utcnow() + timedelta(hours=3)
+    to_encode = {"sub": email, "exp": expire}
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-# ----------------------------
-# Health / root
-# ----------------------------
-@app.get("/", response_model=dict)
+# --- ROUTES ---
+
+@app.get("/")
 def root():
     return {"message": "AI Fraud Detection Backend Running 🚀 with Auth enabled!"}
 
-# ----------------------------
-# AUTH: Signup
-# ----------------------------
-@app.post("/auth/signup", response_model=dict, status_code=status.HTTP_201_CREATED)
-def signup(request: SignupRequest, db: Session = Depends(get_db)):
-    # Check if user exists
-    existing = db.query(models.User).filter(models.User.email == request.email).first()
-    if existing:
+# 1️⃣ SIGNUP
+@app.post("/auth/signup")
+def signup(req: SignupRequest):
+    if req.email in USERS:
         raise HTTPException(status_code=400, detail="Email already registered")
+    USERS[req.email] = req.password
+    return {"message": "User created successfully", "user_id": len(USERS)}
 
-    hashed = auth.get_password_hash(request.password)
-    user = models.User(email=request.email, password_hash=hashed)
-    db.add(user)
-    safe_commit(db)
-    db.refresh(user)
-    logger.info("New user created: %s", user.email)
-    return {"message": "User created successfully", "user_id": user.id}
-
-# ----------------------------
-# AUTH: Login
-# ----------------------------
-@app.post("/auth/login", response_model=dict)
-def login(request: LoginRequest, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.email == request.email).first()
-    if not user or not auth.verify_password(request.password, user.password_hash):
+# 2️⃣ LOGIN
+@app.post("/auth/login")
+def login(req: LoginRequest):
+    if req.email not in USERS or USERS[req.email] != req.password:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = auth.create_access_token({"sub": user.email}, timedelta(minutes=auth.ACCESS_TOKEN_EXPIRE_MINUTES))
-    logger.info("User logged in: %s", user.email)
+    token = create_token(req.email)
     return {"access_token": token, "token_type": "bearer"}
 
-# ----------------------------
-# Link dummy bank account (idempotent)
-# ----------------------------
-@app.post("/bank/link", response_model=dict)
-def link_dummy_account(db: Session = Depends(get_db)):
-    # If an account already exists, return it instead of creating duplicates
-    existing = db.query(models.Account).first()
-    if existing:
-        return {"message": "Dummy account already linked", "account_id": existing.id}
-
-    account = models.Account(
-        account_name="Axis Bank Primary Account",
-        account_number="AXISXXXX8765",
-        bank_name="Axis Bank"
-    )
-    db.add(account)
-    safe_commit(db)
-    db.refresh(account)
-    logger.info("Dummy account linked: %s", account.account_number)
-    return {"message": "Dummy bank account linked successfully", "account_id": account.id}
-
-# ----------------------------
-# Generate dummy transactions
-# ----------------------------
-@app.post("/transactions/generate", response_model=dict)
-def generate_dummy_transactions(count: int = 10, db: Session = Depends(get_db)):
-    """
-    Generate `count` dummy transactions (default 10).
-    Returns list of created transactions with risk attributes.
-    """
-    merchants = ["Amazon", "Flipkart", "Swiggy", "Uber", "Zomato", "Myntra", "BigBasket", "IRCTC", "Paytm", "Ola"]
-    created = []
-
-    account = db.query(models.Account).first()
-    if not account:
-        raise HTTPException(status_code=400, detail="No linked account found. Link one using /bank/link first.")
-
-    # For simple baseline behavior: compute average historical amount (if exists)
-    past = db.query(models.Transaction).filter(models.Transaction.account_id == account.id).all()
-    avg_amount = (sum(p.amount for p in past) / len(past)) if past else 200.0
-
-    for i in range(count):
-        amount = round(random.uniform(20, 20000), 2)
-        # Risk heuristic (simple, explainable):
-        # - Very large amounts relative to avg are risky
-        # - Night time (simulated) adds risk
-        # - Random jitter to keep variety
-        base_risk = min(95.0, max(5.0, (amount / max(1.0, avg_amount)) * 20 + random.uniform(-10, 10)))
-        # small probability event for geo/device anomalies simulated:
-        anomaly = random.random()
-        if anomaly < 0.05:
-            base_risk += 20  # rare anomaly
-        risk_score = round(min(100.0, base_risk), 2)
-
-        risk_label = "Safe" if risk_score < 70 else "Suspicious" if risk_score <= 90 else "High Risk"
-        blocked = risk_score > 90
-        verification_required = 70 < risk_score <= 90
-
-        txn = models.Transaction(
-            account_id=account.id,
-            txn_id=f"TXN{int(datetime.utcnow().timestamp())}{random.randint(100,999)}",
-            amount=amount,
-            merchant=random.choice(merchants),
-            timestamp=datetime.utcnow(),
-            risk_score=risk_score,
-            risk_label=risk_label,
-            blocked=blocked,
-            verification_required=verification_required,
-            verification_status="pending" if verification_required else "none",
-            reasons="['Large amount', 'Unusual merchant']" if risk_score > 75 else "[]"
-        )
-
-        db.add(txn)
-        safe_commit(db)
-        db.refresh(txn)
-
-        created.append({
-            "txn_id": txn.txn_id,
-            "amount": txn.amount,
-            "merchant": txn.merchant,
-            "timestamp": txn.timestamp.isoformat(),
-            "risk_score": txn.risk_score,
-            "risk_label": txn.risk_label,
-            "blocked": txn.blocked,
-            "verification_required": txn.verification_required
-        })
-
-    logger.info("Generated %d transactions for account %s", len(created), account.account_number)
-    return {"message": "Dummy transactions generated successfully", "transactions": created}
-
-# ----------------------------
-# Get all transactions
-# ----------------------------
-@app.get("/transactions", response_model=List[dict])
-def get_all_transactions(db: Session = Depends(get_db)):
-    txns = db.query(models.Transaction).order_by(models.Transaction.timestamp.desc()).all()
-    out = []
-    for t in txns:
-        out.append({
-            "txn_id": t.txn_id,
-            "amount": t.amount,
-            "merchant": t.merchant,
-            "timestamp": t.timestamp.isoformat(),
-            "risk_score": t.risk_score,
-            "risk_label": t.risk_label,
-            "blocked": t.blocked,
-            "verification_required": t.verification_required,
-            "verification_status": t.verification_status,
-            "reasons": t.reasons
-        })
-    return out
-
-# ----------------------------
-# Optional: get transaction by id
-# ----------------------------
-@app.get("/transactions/{txn_id}", response_model=dict)
-def get_transaction(txn_id: str, db: Session = Depends(get_db)):
-    t = db.query(models.Transaction).filter(models.Transaction.txn_id == txn_id).first()
-    if not t:
-        raise HTTPException(status_code=404, detail="Transaction not found")
-    return {
-        "txn_id": t.txn_id,
-        "amount": t.amount,
-        "merchant": t.merchant,
-        "timestamp": t.timestamp.isoformat(),
-        "risk_score": t.risk_score,
-        "risk_label": t.risk_label,
-        "blocked": t.blocked,
-        "verification_required": t.verification_required,
-        "verification_status": t.verification_status,
-        "reasons": t.reasons
+# 3️⃣ LINK DUMMY BANK ACCOUNT
+@app.post("/bank/link")
+def link_bank():
+    global DUMMY_ACCOUNT
+    DUMMY_ACCOUNT = {
+        "account_id": "DUMMY-12345",
+        "balance": 10000.0,
+        "linked": True
     }
+    return {"message": "Dummy bank account linked successfully", "account_id": DUMMY_ACCOUNT["account_id"]}
+
+# 4️⃣ GENERATE DUMMY TRANSACTIONS
+@app.post("/transactions/generate")
+def generate_transactions():
+    global TRANSACTIONS
+    if not DUMMY_ACCOUNT:
+        raise HTTPException(status_code=400, detail="No bank account linked")
+    merchants = ["Amazon", "Starbucks", "Flipkart", "Zara", "Apple Store"]
+    TRANSACTIONS = []
+    for i in range(10):
+        amount = round(random.uniform(10, 5000), 2)
+        risk = round(random.uniform(0, 100), 2)
+        label = "Safe"
+        blocked = False
+        if risk > 90:
+            label = "High Risk"
+            blocked = True
+        elif risk > 60:
+            label = "Suspicious"
+        txn = {
+            "txn_id": f"TXN{i+1:05d}",
+            "amount": amount,
+            "merchant": random.choice(merchants),
+            "risk_score": risk,
+            "risk_label": label,
+            "blocked": blocked
+        }
+        TRANSACTIONS.append(txn)
+    return {"message": "Dummy transactions generated successfully", "transactions": TRANSACTIONS}
+
+# 5️⃣ FETCH ALL TRANSACTIONS
+@app.get("/transactions", response_model=List[Transaction])
+def get_transactions():
+    if not TRANSACTIONS:
+        raise HTTPException(status_code=404, detail="No transactions found")
+    return TRANSACTIONS
+
 
